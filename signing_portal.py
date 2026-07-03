@@ -19,6 +19,7 @@ from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
 from fpdf import FPDF
+import fitz  # PyMuPDF — for embedding signatures into uploaded PDFs
 from PIL import Image as PILImage
 
 try:
@@ -133,6 +134,106 @@ def send_signed_email(to_addr, cc_addr, customer_name, pdf_list, filenames):
         return False, "Gmail authentication failed - check App Password in secrets."
     except Exception as e:
         return False, str(e)
+
+
+def embed_sig_in_uploaded_pdf(pdf_bytes, sig_bytes, signer_name, company, timestamp, ip_addr=""):
+    """
+    Embed the customer signature into an uploaded PDF by:
+      1. Searching every page for signature-related keywords
+      2. Placing the signature image + metadata just below each match
+      3. Falling back to a stamped block at the bottom of the last page
+    Returns the modified PDF as bytes.
+    """
+    # Keywords that indicate a signature location (case-insensitive search)
+    SIG_KEYWORDS = [
+        "authorised signature", "authorized signature",
+        "customer signature",   "client signature",
+        "signed by",            "signature:",
+        "sign here",            "for and on behalf",
+        "for acme",             "for (company",
+        "signed:",              "authorised signatory",
+    ]
+
+    try:
+        doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
+        sig_fitz  = fitz.open(stream=sig_bytes,  filetype="png")
+        placed    = False
+
+        for page_num in range(len(doc)):
+            page       = doc[page_num]
+            page_text  = page.get_text().lower()
+
+            for keyword in SIG_KEYWORDS:
+                if keyword not in page_text:
+                    continue
+
+                # Find exact screen position of keyword on the page
+                hits = page.search_for(keyword)
+                if not hits:
+                    continue
+
+                for rect in hits:
+                    # Place signature image BELOW the keyword line
+                    x0   = rect.x0
+                    y0   = rect.y1 + 4     # 4pt gap below keyword
+                    w, h = 110, 30         # signature image size in points
+
+                    # Don't overflow the page bottom
+                    page_h = page.rect.height
+                    if y0 + h + 30 > page_h - 20:
+                        y0 = page_h - h - 50
+
+                    img_rect = fitz.Rect(x0, y0, x0 + w, y0 + h)
+                    page.insert_image(img_rect, stream=sig_bytes, keep_proportion=True)
+
+                    # Metadata lines below the image
+                    meta_y = y0 + h + 3
+                    page.insert_text((x0, meta_y),      signer_name,
+                                     fontsize=8, color=(0.15, 0.15, 0.15))
+                    page.insert_text((x0, meta_y + 10), company or "",
+                                     fontsize=7, color=(0.4, 0.4, 0.4))
+                    page.insert_text((x0, meta_y + 18), timestamp,
+                                     fontsize=7, color=(0.4, 0.4, 0.4))
+                    if ip_addr and ip_addr not in ("Not captured", ""):
+                        page.insert_text((x0, meta_y + 26), f"IP: {ip_addr}",
+                                         fontsize=6, color=(0.6, 0.6, 0.6))
+                    placed = True
+
+        if not placed:
+            # ── Fallback: stamp a signature block at the bottom of the last page ──
+            page   = doc[-1]
+            page_w = page.rect.width
+            page_h = page.rect.height
+            x0     = 50
+            y0     = page_h - 110
+
+            # Horizontal rule
+            page.draw_line((x0, y0), (x0 + 200, y0),
+                            color=(0.7, 0.7, 0.7), width=0.5)
+            page.insert_text((x0, y0 + 8), "Electronically Signed:",
+                              fontsize=8, color=(0.3, 0.3, 0.3))
+
+            img_rect = fitz.Rect(x0, y0 + 12, x0 + 110, y0 + 42)
+            page.insert_image(img_rect, stream=sig_bytes, keep_proportion=True)
+
+            meta_y = y0 + 46
+            page.insert_text((x0, meta_y),      signer_name,
+                              fontsize=8, color=(0.15, 0.15, 0.15))
+            page.insert_text((x0, meta_y + 10), company or "",
+                              fontsize=7, color=(0.4, 0.4, 0.4))
+            page.insert_text((x0, meta_y + 18), timestamp,
+                              fontsize=7, color=(0.4, 0.4, 0.4))
+            if ip_addr and ip_addr not in ("Not captured", ""):
+                page.insert_text((x0, meta_y + 26), f"IP: {ip_addr}",
+                                  fontsize=6, color=(0.6, 0.6, 0.6))
+
+        result = doc.tobytes()
+        doc.close()
+        return result, placed
+
+    except Exception as e:
+        # If anything goes wrong with PDF manipulation, return the original unchanged
+        return pdf_bytes, False
 
 
 def build_certificate(sig_bytes, sig_name, company, timestamp, ip_addr, doc_bytes_for_hash):
@@ -408,11 +509,24 @@ if st.button("✍️  Sign & Send Documents", type="primary", use_container_widt
         ip         = get_client_ip()
         signer_str = f"{confirm_name} - {confirm_role}" if confirm_role else confirm_name
 
+        # Embed signature into each uploaded PDF
+        signed_docs  = []
+        detect_notes = []
+        for doc_name, doc_bytes in doc_data:
+            signed_bytes, auto_placed = embed_sig_in_uploaded_pdf(
+                doc_bytes, sig_bytes, signer_str, customer_name, ts, ip
+            )
+            signed_docs.append((doc_name, signed_bytes))
+            detect_notes.append(
+                f"- **{doc_name}**: signature {'auto-placed at detected signature block' if auto_placed else 'stamped at bottom of last page (no signature block found)'}"
+            )
+
+        # Build Certificate of Completion
         cert_bytes = build_certificate(sig_bytes, signer_str, customer_name, ts, ip, doc_data[0][1])
         cert_name  = f"Certificate_of_Completion_{customer_name.replace(' ','_')}.pdf"
 
-        all_pdf_bytes = [d[1] for d in doc_data] + [cert_bytes]
-        all_names     = [d[0] for d in doc_data] + [cert_name]
+        all_pdf_bytes = [d[1] for d in signed_docs] + [cert_bytes]
+        all_names     = [d[0] for d in signed_docs] + [cert_name]
 
         # CC both the sender and Novalink info address so you always get a copy
         cc_addresses = ", ".join(filter(None, [sender_email, "info@novalinkhardware.co.uk"]))
@@ -432,9 +546,16 @@ if st.button("✍️  Sign & Send Documents", type="primary", use_container_widt
           All documents and your Certificate of Completion have been emailed to <strong>{customer_email}</strong>.<br/>
           Signed: {ts} &nbsp;|&nbsp; Reference: {gist_id[:12].upper()}
         </div>""", unsafe_allow_html=True)
+        with st.expander("📍 Signature placement details"):
+            for note in detect_notes:
+                st.markdown(note)
         st.balloons()
     else:
         st.error(f"Signing recorded but email failed: {msg}")
 
     st.download_button("📥 Download Certificate of Completion", data=cert_bytes,
                        file_name=cert_name, mime="application/pdf", use_container_width=True)
+    for doc_name, signed_bytes in signed_docs:
+        st.download_button(f"📥 Download signed: {doc_name}", data=signed_bytes,
+                           file_name=f"SIGNED_{doc_name}", mime="application/pdf",
+                           use_container_width=True, key=f"dl_signed_{doc_name}")
