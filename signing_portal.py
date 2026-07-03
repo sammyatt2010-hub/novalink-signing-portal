@@ -414,7 +414,9 @@ if st.button("✍️  Sign & Send Documents", type="primary", use_container_widt
         all_pdf_bytes = [d[1] for d in doc_data] + [cert_bytes]
         all_names     = [d[0] for d in doc_data] + [cert_name]
 
-        ok, msg = send_signed_email(customer_email, sender_email, customer_name, all_pdf_bytes, all_names)
+        # CC both the sender and Novalink info address so you always get a copy
+        cc_addresses = ", ".join(filter(None, [sender_email, "info@novalinkhardware.co.uk"]))
+        ok, msg = send_signed_email(customer_email, cc_addresses, customer_name, all_pdf_bytes, all_names)
 
         update_gist(gist_id,
             {"session.json": {"content": json.dumps({**session,
