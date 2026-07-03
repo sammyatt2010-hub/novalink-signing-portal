@@ -71,8 +71,13 @@ FROM_NAME    = _secret("FROM_NAME", "Novalink Hardware")
 # Show setup banner if secrets are missing
 if not GITHUB_TOKEN:
     st.warning("Setup required: add GITHUB_TOKEN, SMTP_USER, SMTP_PASS and FROM_NAME to this app's Streamlit Cloud secrets (Settings > Secrets).")
+
+
+def fetch_gist(gist_id):
+    hdrs = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"} if GITHUB_TOKEN else {}
     r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=hdrs, timeout=10)
     return r.json() if r.status_code == 200 else None
+
 
 
 def update_gist(gist_id, files_dict, description=None):
