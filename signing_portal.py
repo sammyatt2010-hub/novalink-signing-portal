@@ -260,54 +260,127 @@ _ready = bool(sig_bytes_rs and sig_name_rs)
 if not _ready:
     st.caption("Please complete your name and signature above to submit.")
 
-def _build_receipt_pdf(comp, signer, position, sig_img_bytes, hw, svc, term_label, install):
-    """Generate a signed receipt PDF."""
+def _build_receipt_pdf(comp, signer, position, sig_img_bytes, hw, svc, term_label, install, email="", ref_id="", ts="", ip_addr=""):
+    """Generate a Certificate of Completion matching the main SY Comms app style."""
     from fpdf import FPDF
+    import uuid as _uuid, hashlib as _hl, tempfile as _tf, os as _os
+    from datetime import datetime as _dt
     def _s(t): return str(t or "").encode("latin-1",errors="replace").decode("latin-1")
+
+    _envelope_id = ref_id.upper() or str(_uuid.uuid4()).upper()
+    _doc_hash    = _hl.sha256(sig_img_bytes).hexdigest().upper() if sig_img_bytes else "N/A"
+    _signed_at   = ts or _dt.now().strftime("%Y-%m-%d %H:%M UTC")
+    _ip          = ip_addr or "Remote Signing Portal"
+    _sig_method  = "Hand-drawn (Remote Signing Portal)"
+
     p = FPDF(); p.add_page(); p.set_auto_page_break(True, margin=15)
-    # Header
-    p.set_fill_color(31,20,80); p.rect(0,0,210,30,"F")
-    p.set_fill_color(0,181,163); p.rect(0,30,210,2,"F")
-    p.set_text_color(255,255,255); p.set_font("Helvetica","B",16)
-    p.set_y(8); p.cell(0,8,"SY COMMS LTD - Signed Agreement Receipt",ln=True,align="C")
-    p.set_font("Helvetica","",8); p.set_text_color(0,181,163)
-    p.cell(0,6,"hello@sycomms.co.uk  |  01743 667419  |  www.sycomms.co.uk",ln=True,align="C")
-    p.set_text_color(0,0,0); p.set_y(38)
-    # Deal summary
-    p.set_font("Helvetica","B",10); p.set_fill_color(245,247,255)
-    p.cell(0,7,_s(f"  Agreement Summary - {comp}"),fill=True,ln=True)
-    p.set_font("Helvetica","",9)
-    rows = [("Company",_s(comp)),("Signed by",_s(f"{signer} ({position})")),
-            ("Date",date.today().strftime("%d %B %Y")),
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    p.set_fill_color(31,20,80); p.rect(0,0,210,22,"F")
+    p.set_font("Helvetica","B",13); p.set_text_color(255,255,255)
+    p.set_y(5); p.cell(0,6,"CERTIFICATE OF COMPLETION",ln=True,align="C")
+    p.set_font("Helvetica","",8)
+    p.cell(0,5,"SY Comms  |  Electronic Signing Record",ln=True,align="C")
+    p.set_fill_color(0,181,163); p.rect(0,22,210,1.5,"F")
+    p.set_text_color(0,0,0); p.ln(8)
+
+    lx = p.l_margin
+
+    def _section_hdr(title):
+        p.set_font("Helvetica","B",9); p.set_fill_color(220,235,245); p.set_text_color(13,46,74)
+        p.cell(0,6,_s(f"  {title}"),fill=True,ln=True); p.set_text_color(0,0,0)
+
+    def _env_row(l,v,color=(0,0,0)):
+        p.set_font("Helvetica","B",8); p.set_text_color(100,100,100)
+        p.cell(52,5.5,_s(l),ln=False)
+        p.set_font("Helvetica","",8); p.set_text_color(*color)
+        p.cell(0,5.5,_s(str(v))[:70],ln=True); p.set_text_color(0,0,0)
+
+    def _row3(c1,c2,c3,h=5.5,bold1=False):
+        p.set_font("Helvetica","B" if bold1 else "",8)
+        p.cell(65,h,_s(c1),border="B",ln=False)
+        p.set_font("Helvetica","",8)
+        p.cell(65,h,_s(c2),border="B",ln=False)
+        p.cell(0, h,_s(c3),border="B",ln=True)
+
+    # ── Envelope Summary ─────────────────────────────────────────────────────
+    p.set_font("Helvetica","B",9); p.set_text_color(13,46,74)
+    p.cell(0,6,"Envelope Summary",ln=True)
+    p.set_draw_color(0,181,163); p.set_line_width(0.4)
+    p.line(lx,p.get_y(),195,p.get_y()); p.set_line_width(0.2); p.set_draw_color(200,200,200)
+    p.ln(2)
+    _env_row("Envelope ID:", _envelope_id)
+    _env_row("Status:", "COMPLETED", color=(0,140,70))
+    _env_row("Subject:", f"SY Comms Proposal - {comp[:40]}")
+    _env_row("Originator:", "SY Comms")
+    _env_row("Signed Via:", "SY Comms Remote Signing Portal")
+    _env_row("Time Zone:", "(UTC+00:00) Dublin, Edinburgh, Lisbon, London")
+    _env_row("Originator Email:", "sales@sycomms.co.uk")
+    p.ln(4)
+
+    # ── Record Tracking ───────────────────────────────────────────────────────
+    _section_hdr("Record Tracking")
+    p.ln(1)
+    _row3("Status","Holder","Location",bold1=True)
+    _row3("Original","SY Comms","SY Comms Quotation Tool")
+    _row3(_signed_at,"sales@sycomms.co.uk","Streamlit Cloud")
+    p.ln(4)
+
+    # ── Signer Events ─────────────────────────────────────────────────────────
+    _section_hdr("Signer Events")
+    p.ln(1); _row3("Signer Details","Signature","Timestamps",bold1=True)
+
+    y_row = p.get_y()
+    p.set_font("Helvetica","B",8); p.cell(65,5,_s(signer),ln=False)
+    # Signature image
+    if sig_img_bytes:
+        try:
+            with _tf.NamedTemporaryFile(suffix=".png",delete=False) as _stf:
+                _stf.write(sig_img_bytes); _sp=_stf.name
+            p.image(_sp,x=lx+67,y=y_row,w=60,h=18)
+            _os.unlink(_sp)
+        except Exception: pass
+    # Timestamps
+    p.set_xy(lx+135,y_row); p.set_font("Helvetica","",7.5)
+    p.cell(0,5,_s(f"Sent:   {_signed_at}"),ln=True)
+    p.set_xy(lx+135,y_row+5); p.cell(0,5,_s(f"Viewed: {_signed_at}"),ln=True)
+    p.set_xy(lx+135,y_row+10); p.cell(0,5,_s(f"Signed: {_signed_at}"),ln=True)
+    # Signer details below name
+    p.set_y(y_row+1); p.set_x(lx); p.set_font("Helvetica","",8)
+    p.cell(65,5,_s(email or "-"),ln=True)
+    p.set_x(lx); p.cell(65,5,_s(comp),ln=True)
+    p.set_x(lx); p.cell(65,5,_s(f"Position: {position}"),ln=True)
+    p.set_x(lx); p.set_font("Helvetica","I",7.5); p.set_text_color(80,80,80)
+    p.cell(65,5,"Security: Remote Digital Signature",ln=True)
+    p.set_x(lx); p.cell(65,5,_s(f"IP: {_ip}"),ln=True)
+    p.set_x(lx); p.cell(65,5,_s(f"Method: {_sig_method}"),ln=True)
+    p.set_text_color(0,0,0); p.ln(2)
+    p.set_draw_color(200,200,200); p.line(lx,p.get_y(),195,p.get_y()); p.ln(4)
+
+    # ── Document Fields ────────────────────────────────────────────────────────
+    _section_hdr("Agreement Summary")
+    p.ln(1)
+    rows = [("Company",comp),("Signed by",f"{signer} ({position})"),
+            ("Date Signed",date.today().strftime("%d %B %Y")),
             ("Monthly Lease",f"GBP {hw:.2f}/mo"),
             ("Monthly Services",f"GBP {svc:.2f}/mo"),
             ("Total Monthly",f"GBP {hw+svc:.2f}/mo (excl. VAT)"),
-            ("Agreement Term",_s(term_label)),("Installation",_s(install))]
+            ("Agreement Term",term_label),("Installation",install),
+            ("Document Hash (SHA-256)",_doc_hash[:40]+"...")]
     for i,(lbl,val) in enumerate(rows):
         p.set_fill_color(248,249,255) if i%2==0 else p.set_fill_color(255,255,255)
-        p.cell(60,6,_s(f"  {lbl}:"),fill=True,ln=False)
-        p.cell(0,6,_s(str(val)),fill=True,ln=True)
-    p.ln(6)
-    # Signature
-    p.set_font("Helvetica","B",10); p.set_fill_color(245,247,255)
-    p.cell(0,7,"  Customer Signature",fill=True,ln=True)
-    p.ln(2)
-    if sig_img_bytes:
-        try:
-            import tempfile,os
-            with tempfile.NamedTemporaryFile(suffix=".png",delete=False) as tf:
-                tf.write(sig_img_bytes); tp=tf.name
-            p.image(tp,x=p.l_margin,y=p.get_y(),w=80,h=22)
-            os.unlink(tp); p.ln(24)
-        except Exception: p.ln(6)
-    p.set_font("Helvetica","",9)
-    p.cell(0,5,_s(f"Signed: {signer}"),ln=True)
-    p.cell(0,5,_s(f"Position: {position}"),ln=True)
-    p.cell(0,5,_s(f"Date: {date.today().strftime('%d %B %Y')}"),ln=True)
-    p.ln(6)
+        p.set_font("Helvetica","B",8); p.set_text_color(80,80,80)
+        p.cell(60,5.5,_s(f"  {lbl}:"),fill=True,ln=False)
+        p.set_font("Helvetica","",8); p.set_text_color(0,0,0)
+        p.cell(0,5.5,_s(str(val)),fill=True,ln=True)
+    p.ln(4)
+
+    # ── Footer ─────────────────────────────────────────────────────────────────
     p.set_font("Helvetica","I",7); p.set_text_color(130,130,130)
-    p.multi_cell(0,4,"By submitting this form, the signatory confirms agreement to the SY Comms "
-                 "proposal and Terms & Conditions: https://sycomms.co.uk/terms-conditions",align="C")
+    p.multi_cell(0,4,
+        "This certificate confirms the electronic execution of the above agreement. "
+        "The signatory confirms agreement to SY Comms Terms & Conditions: "
+        "https://sycomms.co.uk/terms-conditions",align="C")
     p.set_text_color(0,0,0)
     return bytes(p.output())
 
@@ -353,10 +426,16 @@ if st.button("📨 Submit Signed Agreement", use_container_width=True,
              type="primary", disabled=not _ready, key="rs_submit"):
     signed_date = date.today().strftime("%d %B %Y")
     # Build receipt PDF
+    from datetime import datetime as _dtnow
+    _ts_now = _dtnow.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     receipt_pdf = _build_receipt_pdf(
         comp=comp_name, signer=sig_name_rs, position=sig_pos_rs,
         sig_img_bytes=sig_bytes_rs,
-        hw=hw_rental, svc=svc_total, term_label=lease_label, install=install_type
+        hw=hw_rental, svc=svc_total, term_label=lease_label, install=install_type,
+        email=deal.get("customer_email",""),
+        ref_id=gist_id[:36],
+        ts=_ts_now,
+        ip_addr="Remote Signing Portal (IP not captured in cloud)"
     )
     # Email to SY Comms
     _email_ok, _email_msg = _email_receipt(receipt_pdf, comp_name, sig_name_rs, signed_date)
