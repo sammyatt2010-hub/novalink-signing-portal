@@ -75,18 +75,44 @@ def load_gist(gid, token=""):
         return None, f"GitHub error {r.status_code}"
     files = r.json().get("files", {})
     # Prefer session.json
+    _session = None
     for fname in ("session.json",):
         if fname in files:
             raw = files[fname]
             if raw.get("truncated"):
                 r2 = requests.get(raw["raw_url"], headers=hdrs, timeout=15)
-                return json.loads(r2.text), None
-            return json.loads(raw["content"]), None
+                _session = json.loads(r2.text)
+            else:
+                _session = json.loads(raw["content"])
+    if _session is not None:
+        doc_bytes_list = []
+        for fname in sorted(files.keys()):
+            if fname.startswith("doc_") and fname.endswith(".b64"):
+                raw = files[fname]
+                if raw.get("truncated"):
+                    r2 = requests.get(raw["raw_url"], headers=hdrs, timeout=30)
+                    doc_bytes_list.append(base64.b64decode(r2.text))
+                else:
+                    doc_bytes_list.append(base64.b64decode(raw["content"]))
+        return _session, doc_bytes_list, None
     # Fallback: any JSON file
     for fname, fdata in files.items():
         if fname.endswith(".json"):
-            return json.loads(fdata["content"]), None
-    return None, "No deal data found in this link."
+            session = json.loads(fdata["content"])
+            break
+    else:
+        return None, None, "No deal data found in this link."
+    # Read original PDF docs (doc_*.b64)
+    doc_bytes_list = []
+    for fname in sorted(files.keys()):
+        if fname.startswith("doc_") and fname.endswith(".b64"):
+            raw = files[fname]
+            if raw.get("truncated"):
+                r2 = requests.get(raw["raw_url"], headers=hdrs, timeout=30)
+                doc_bytes_list.append(base64.b64decode(r2.text))
+            else:
+                doc_bytes_list.append(base64.b64decode(raw["content"]))
+    return session, doc_bytes_list, None
 
 # Read token outside the cached function
 _gh_token = ""
@@ -97,7 +123,7 @@ if hasattr(st, "secrets"):
         pass
 
 with st.spinner("Loading your proposal…"):
-    deal, _err = load_gist(gist_id, token=_gh_token)
+    deal, _orig_docs, _err = load_gist(gist_id, token=_gh_token)
 
 if deal is None:
     st.error(f"Could not load proposal: {_err or 'Link may have expired.'} "
@@ -126,7 +152,7 @@ st.markdown(
 )
 
 # ── Key figures ───────────────────────────────────────────────────────────────
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 with col1:
     st.markdown(f"""<div class="sy-card">
       <div class="sy-label">Monthly Lease</div>
@@ -138,12 +164,6 @@ with col2:
       <div class="sy-label">Monthly Services</div>
       <div class="sy-value">£{svc_total:.2f}/mo</div>
       <div style="font-size:0.78rem;color:#aaa">{bb_info if bb_info else "Licences + BB + VAT"}</div>
-    </div>""", unsafe_allow_html=True)
-with col3:
-    st.markdown(f"""<div class="sy-card">
-      <div class="sy-label">Agreement Term</div>
-      <div class="sy-value">{lease_label}</div>
-      <div style="font-size:0.78rem;color:#aaa">{install_type}</div>
     </div>""", unsafe_allow_html=True)
 
 # ── Download proposal PDF if included ────────────────────────────────────────
@@ -161,8 +181,9 @@ if pdf_b64:
 # ── Signature capture ─────────────────────────────────────────────────────────
 st.markdown("### ✍️ Sign Below to Confirm")
 st.caption(
-    "By signing below, I/we confirm I have read and agree to the proposal and "
-    "SY Comms Terms & Conditions (https://sycomms.co.uk/terms-conditions)."
+    f"By signing below, I/we confirm I have read and agree to the proposal and "
+    f"SY Comms Terms & Conditions (https://sycomms.co.uk/terms-conditions). "
+    f"Agreement term: {lease_label}."
 )
 
 sig_name_rs = st.text_input("Full Name", placeholder="Jane Smith", key="rs_sig_name")
@@ -340,6 +361,7 @@ if st.button("📨 Submit Signed Agreement", use_container_width=True,
     # Email to SY Comms
     _email_ok, _email_msg = _email_receipt(receipt_pdf, comp_name, sig_name_rs, signed_date)
     st.session_state["_rs_receipt_pdf"]  = receipt_pdf
+    st.session_state["_rs_orig_docs"]    = _orig_docs or []
     st.session_state["_rs_receipt_name"] = f"SYComms_Signed_{comp_name.replace(' ','_')}_{signed_date.replace(' ','_')}.pdf"
     st.session_state["_rs_submitted"]    = True
     st.session_state["_rs_email_ok"]     = _email_ok
@@ -356,12 +378,28 @@ if st.session_state.get("_rs_submitted"):
       <strong>Signed by:</strong> {signer_display}<br>
       <strong>Your SY Comms consultant will be in touch shortly.</strong>
     </div>""", unsafe_allow_html=True)
-    _receipt = st.session_state.get("_rs_receipt_pdf")
-    _rname   = st.session_state.get("_rs_receipt_name","signed_receipt.pdf")
+    _receipt   = st.session_state.get("_rs_receipt_pdf")
+    _orig_docs = st.session_state.get("_rs_orig_docs", [])
+    _rname     = st.session_state.get("_rs_receipt_name","signed_receipt.pdf")
+    # Merge original pack + signed receipt into one PDF
     if _receipt:
-        st.download_button("📄 Download Your Signed Copy",data=_receipt,
-                           file_name=_rname,mime="application/pdf",
-                           use_container_width=True,key="rs_dl_receipt")
+        try:
+            from pypdf import PdfWriter, PdfReader
+            writer = PdfWriter()
+            for _doc in _orig_docs:
+                writer.append(PdfReader(io.BytesIO(_doc)))
+            writer.append(PdfReader(io.BytesIO(_receipt)))
+            _merged = io.BytesIO()
+            writer.write(_merged)
+            _pack_bytes = _merged.getvalue()
+            _pack_name  = _rname.replace("signed_receipt","SIGNED_PACK")
+        except Exception:
+            _pack_bytes = _receipt
+            _pack_name  = _rname
+        st.download_button("📄 Download Signed Documents Pack",
+                           data=_pack_bytes, file_name=_pack_name,
+                           mime="application/pdf",
+                           use_container_width=True, key="rs_dl_receipt")
     if st.session_state.get("_rs_email_ok"):
         st.caption("✅ A copy has been sent to the SY Comms team.")
     else:
