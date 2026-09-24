@@ -331,8 +331,19 @@ def _build_receipt_pdf(comp, signer, position, sig_img_bytes, hw, svc, term_labe
     p.ln(1); _row3("Signer Details","Signature","Timestamps",bold1=True)
 
     y_row = p.get_y()
-    p.set_font("Helvetica","B",8); p.cell(65,5,_s(signer),ln=False)
-    # Signature image
+    # Left column: signer info (stacked clearly)
+    p.set_font("Helvetica","B",8); p.set_xy(lx, y_row)
+    p.cell(65,5,_s(signer),ln=True)
+    p.set_font("Helvetica","",8); p.set_x(lx)
+    p.cell(65,5,_s(email or "-"),ln=True)
+    p.set_x(lx); p.cell(65,5,_s(comp),ln=True)
+    p.set_x(lx); p.cell(65,5,_s(f"Position: {position}"),ln=True)
+    p.set_x(lx); p.set_font("Helvetica","I",7); p.set_text_color(80,80,80)
+    p.cell(65,5,"Security: Remote Digital Signature",ln=True)
+    p.set_x(lx); p.cell(65,5,"Via SY Comms Remote Signing Portal",ln=True)
+    p.set_x(lx); p.cell(65,5,_s(f"Method: {_sig_method}"),ln=True)
+    p.set_text_color(0,0,0)
+    # Middle column: signature image
     if sig_img_bytes:
         try:
             with _tf.NamedTemporaryFile(suffix=".png",delete=False) as _stf:
@@ -340,22 +351,13 @@ def _build_receipt_pdf(comp, signer, position, sig_img_bytes, hw, svc, term_labe
             p.image(_sp,x=lx+67,y=y_row,w=60,h=18)
             _os.unlink(_sp)
         except Exception: pass
-    # Timestamps
+    # Right column: timestamps
     p.set_xy(lx+135,y_row); p.set_font("Helvetica","",7.5)
     p.cell(0,5,_s(f"Sent:   {_signed_at}"),ln=True)
     p.set_xy(lx+135,y_row+5); p.cell(0,5,_s(f"Viewed: {_signed_at}"),ln=True)
     p.set_xy(lx+135,y_row+10); p.cell(0,5,_s(f"Signed: {_signed_at}"),ln=True)
-    # Signer details below name
-    p.set_y(y_row+1); p.set_x(lx); p.set_font("Helvetica","",8)
-    p.cell(65,5,_s(email or "-"),ln=True)
-    p.set_x(lx); p.cell(65,5,_s(comp),ln=True)
-    p.set_x(lx); p.cell(65,5,_s(f"Position: {position}"),ln=True)
-    p.set_x(lx); p.set_font("Helvetica","I",7.5); p.set_text_color(80,80,80)
-    p.cell(65,5,"Security: Remote Digital Signature",ln=True)
-    p.set_x(lx); p.cell(65,5,_s(f"IP: {_ip}"),ln=True)
-    p.set_x(lx); p.cell(65,5,_s(f"Method: {_sig_method}"),ln=True)
-    p.set_text_color(0,0,0); p.ln(2)
-    p.set_draw_color(200,200,200); p.line(lx,p.get_y(),195,p.get_y()); p.ln(4)
+    p.set_y(max(p.get_y(), y_row+38))
+    p.ln(2); p.set_draw_color(200,200,200); p.line(lx,p.get_y(),195,p.get_y()); p.ln(4)
 
     # ── Document Fields ────────────────────────────────────────────────────────
     _section_hdr("Agreement Summary")
@@ -428,6 +430,7 @@ if st.button("📨 Submit Signed Agreement", use_container_width=True,
     # Build receipt PDF
     from datetime import datetime as _dtnow
     _ts_now = _dtnow.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    st.session_state["_rs_ts"] = _ts_now
     receipt_pdf = _build_receipt_pdf(
         comp=comp_name, signer=sig_name_rs, position=sig_pos_rs,
         sig_img_bytes=sig_bytes_rs,
@@ -460,19 +463,55 @@ if st.session_state.get("_rs_submitted"):
     _receipt   = st.session_state.get("_rs_receipt_pdf")
     _orig_docs = st.session_state.get("_rs_orig_docs", [])
     _rname     = st.session_state.get("_rs_receipt_name","signed_receipt.pdf")
-    # Merge original pack + signed receipt into one PDF
+    # Merge original pack (with signature stamps) + certificate into one PDF
     if _receipt:
         try:
-            from pypdf import PdfWriter, PdfReader
+            from pypdf import PdfWriter, PdfReader, PageObject
+            from pypdf.generic import RectangleObject
+            import fpdf as _fpdf_mod
+
+            def _make_sig_stamp(signer, position, ts, sig_bytes):
+                """Create a small fpdf PDF with just the signature block to stamp onto pages."""
+                def _s2(t): return str(t or "").encode("latin-1",errors="replace").decode("latin-1")
+                sp = _fpdf_mod.FPDF(); sp.add_page(); sp.set_auto_page_break(False)
+                sp.set_font("Helvetica","",7); sp.set_text_color(80,80,80)
+                # Signature image
+                if sig_bytes:
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".png",delete=False) as _stf2:
+                            _stf2.write(sig_bytes); _sp2=_stf2.name
+                        sp.image(_sp2, x=10, y=240, w=55, h=14)
+                        os.unlink(_sp2)
+                    except Exception: pass
+                sp.set_xy(10, 255)
+                sp.cell(0,4,_s2(f"Signed: {signer} ({position})"),ln=True)
+                sp.set_x(10); sp.cell(0,4,_s2(ts),ln=True)
+                sp.set_text_color(0,0,0)
+                return bytes(sp.output())
+
+            sig_stamp_bytes = _make_sig_stamp(
+                sig_name_rs, sig_pos_rs,
+                st.session_state.get("_rs_ts",""),
+                sig_bytes_rs
+            )
+            stamp_reader = PdfReader(io.BytesIO(sig_stamp_bytes))
+            stamp_page   = stamp_reader.pages[0]
+
             writer = PdfWriter()
-            for _doc in _orig_docs:
-                writer.append(PdfReader(io.BytesIO(_doc)))
+            for doc_idx, _doc in enumerate(_orig_docs):
+                reader = PdfReader(io.BytesIO(_doc))
+                for pg_idx, page in enumerate(reader.pages):
+                    # Stamp signature on all pages except page 0 (cover)
+                    if not (doc_idx == 0 and pg_idx == 0):
+                        page.merge_page(stamp_page)
+                    writer.add_page(page)
+            # Append certificate
             writer.append(PdfReader(io.BytesIO(_receipt)))
             _merged = io.BytesIO()
             writer.write(_merged)
             _pack_bytes = _merged.getvalue()
             _pack_name  = _rname.replace("signed_receipt","SIGNED_PACK")
-        except Exception:
+        except Exception as _merge_err:
             _pack_bytes = _receipt
             _pack_name  = _rname
         st.download_button("📄 Download Signed Documents Pack",
