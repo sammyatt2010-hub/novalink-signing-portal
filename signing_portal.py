@@ -52,8 +52,19 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Load deal data from Gist ──────────────────────────────────────────────────
-params = st.query_params
+params  = st.query_params
 gist_id = params.get("gist", "")
+
+# Try to capture client IP via Streamlit internals
+_client_ip = "Not captured"
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx as _get_ctx
+    from streamlit.runtime import get_instance as _get_rt
+    _ctx = _get_ctx()
+    if _ctx:
+        _client_ip = _get_rt().get_client(_ctx.session_id).request.remote_ip or "Not captured"
+except Exception:
+    pass
 
 if not gist_id:
     st.warning("No proposal link found. Please use the link provided by your SY Comms consultant.")
@@ -340,7 +351,7 @@ def _build_receipt_pdf(comp, signer, position, sig_img_bytes, hw, svc, term_labe
     p.set_x(lx); p.cell(65,5,_s(f"Position: {position}"),ln=True)
     p.set_x(lx); p.set_font("Helvetica","I",7); p.set_text_color(80,80,80)
     p.cell(65,5,"Security: Remote Digital Signature",ln=True)
-    p.set_x(lx); p.cell(65,5,"Via SY Comms Remote Signing Portal",ln=True)
+    p.set_x(lx); p.cell(65,5,_s(f"IP Address: {_ip}"),ln=True)
     p.set_x(lx); p.cell(65,5,_s(f"Method: {_sig_method}"),ln=True)
     p.set_text_color(0,0,0)
     # Middle column: signature image
@@ -438,7 +449,7 @@ if st.button("📨 Submit Signed Agreement", use_container_width=True,
         email=deal.get("customer_email",""),
         ref_id=gist_id[:36],
         ts=_ts_now,
-        ip_addr="Remote Signing Portal (IP not captured in cloud)"
+        ip_addr=_client_ip
     )
     # Email to SY Comms
     _email_ok, _email_msg = _email_receipt(receipt_pdf, comp_name, sig_name_rs, signed_date)
@@ -463,55 +474,77 @@ if st.session_state.get("_rs_submitted"):
     _receipt   = st.session_state.get("_rs_receipt_pdf")
     _orig_docs = st.session_state.get("_rs_orig_docs", [])
     _rname     = st.session_state.get("_rs_receipt_name","signed_receipt.pdf")
-    # Merge original pack (with signature stamps) + certificate into one PDF
+    # Build signed pack: stamp signature on relevant pages + append certificate
     if _receipt:
         try:
-            from pypdf import PdfWriter, PdfReader, PageObject
-            from pypdf.generic import RectangleObject
+            from pypdf import PdfWriter, PdfReader
             import fpdf as _fpdf_mod
 
-            def _make_sig_stamp(signer, position, ts, sig_bytes):
-                """Create a small fpdf PDF with just the signature block to stamp onto pages."""
-                def _s2(t): return str(t or "").encode("latin-1",errors="replace").decode("latin-1")
-                sp = _fpdf_mod.FPDF(); sp.add_page(); sp.set_auto_page_break(False)
-                sp.set_font("Helvetica","",7); sp.set_text_color(80,80,80)
-                # Signature image
+            _ts_stamp = st.session_state.get("_rs_ts", "")
+
+            def _make_stamp_at(sig_bytes, signer, ts, y_mm):
+                """Create A4 overlay with signature block at given y position (mm)."""
+                def _ss(t): return str(t or "").encode("latin-1",errors="replace").decode("latin-1")
+                sp = _fpdf_mod.FPDF(); sp.set_margins(0,0,0)
+                sp.add_page(); sp.set_auto_page_break(False)
                 if sig_bytes:
                     try:
-                        with tempfile.NamedTemporaryFile(suffix=".png",delete=False) as _stf2:
-                            _stf2.write(sig_bytes); _sp2=_stf2.name
-                        sp.image(_sp2, x=10, y=240, w=55, h=14)
-                        os.unlink(_sp2)
-                    except Exception: pass
-                sp.set_xy(10, 255)
-                sp.cell(0,4,_s2(f"Signed: {signer} ({position})"),ln=True)
-                sp.set_x(10); sp.cell(0,4,_s2(ts),ln=True)
-                sp.set_text_color(0,0,0)
+                        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as _stf:
+                            _stf.write(sig_bytes); _stmp = _stf.name
+                        sp.image(_stmp, x=15, y=y_mm, w=55, h=13)
+                        os.unlink(_stmp)
+                    except Exception:
+                        pass
+                sp.set_xy(15, y_mm + 14)
+                sp.set_font("Helvetica","",6.5); sp.set_text_color(60,60,60)
+                sp.cell(0,3.5,_ss(f"Signed: {signer}  |  {ts}"),ln=True)
                 return bytes(sp.output())
 
-            sig_stamp_bytes = _make_sig_stamp(
-                sig_name_rs, sig_pos_rs,
-                st.session_state.get("_rs_ts",""),
-                sig_bytes_rs
-            )
-            stamp_reader = PdfReader(io.BytesIO(sig_stamp_bytes))
-            stamp_page   = stamp_reader.pages[0]
+            def _find_signed_y(page):
+                """Find y position (in mm) of the LOWEST 'Signed:' on a page."""
+                PAGE_H_PT = float(page.mediabox.height)  # points, origin bottom-left
+                _hits = []
+                def _visit(text, cm, tm, fd, fs):
+                    if text and "signed" in text.lower():
+                        # tm[5] is y in points from bottom; convert to mm from top
+                        y_pt = tm[5]
+                        y_mm = (PAGE_H_PT - y_pt) / 2.8346
+                        _hits.append(y_mm)
+                try:
+                    page.extract_text(visitor_text=_visit)
+                except Exception:
+                    pass
+                # Return lowest instance (highest y_mm = furthest down the page)
+                return max(_hits) - 2 if _hits else None  # 2mm above the text
+
+            _SIG_MARKERS = ("signed:", "for ", "authorised signatory",
+                            "i/we confirm", "i confirm", "customer signature")
 
             writer = PdfWriter()
-            for doc_idx, _doc in enumerate(_orig_docs):
+            for _doc in _orig_docs:
                 reader = PdfReader(io.BytesIO(_doc))
-                for pg_idx, page in enumerate(reader.pages):
-                    # Stamp signature on all pages except page 0 (cover)
-                    if not (doc_idx == 0 and pg_idx == 0):
-                        page.merge_page(stamp_page)
+                for page in reader.pages:
+                    try:
+                        page_text = page.extract_text() or ""
+                        needs_sig = any(m in page_text.lower() for m in _SIG_MARKERS)
+                    except Exception:
+                        needs_sig = False; page_text = ""
+                    if needs_sig:
+                        y_pos = _find_signed_y(page)
+                        if y_pos is None or y_pos > 270:
+                            y_pos = 255  # fallback: near bottom
+                        stamp_bytes = _make_stamp_at(sig_bytes_rs, sig_name_rs, _ts_stamp, y_pos)
+                        stamp_reader = PdfReader(io.BytesIO(stamp_bytes))
+                        page.merge_page(stamp_reader.pages[0])
                     writer.add_page(page)
-            # Append certificate
+
+            # Append Certificate of Completion
             writer.append(PdfReader(io.BytesIO(_receipt)))
             _merged = io.BytesIO()
             writer.write(_merged)
             _pack_bytes = _merged.getvalue()
-            _pack_name  = _rname.replace("signed_receipt","SIGNED_PACK")
-        except Exception as _merge_err:
+            _pack_name  = _rname.replace("signed_receipt", "SIGNED_PACK")
+        except Exception as _me:
             _pack_bytes = _receipt
             _pack_name  = _rname
         st.download_button("📄 Download Signed Documents Pack",
