@@ -1,561 +1,245 @@
 """
-Novalink Hardware — Remote Customer Signing Portal
-Deploy this as a SEPARATE Streamlit app at e.g. novalink-signing.streamlit.app
-Customers receive a unique link: https://your-signing-app.streamlit.app/?gist=GIST_ID
+SY Comms — Remote Signing Portal
+A standalone Streamlit app that lets customers review and sign their proposal
+without needing to be in the room. Deal data is passed via a GitHub Gist ID
+in the URL query parameter.
 """
-
 import streamlit as st
-import requests
-import base64
-import json
-import io
-import hashlib
-import uuid
-import smtplib
-import numpy as np
-from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
-from fpdf import FPDF
-import fitz  # PyMuPDF — for embedding signatures into uploaded PDFs
-from PIL import Image as PILImage
+import requests, json, base64, io, tempfile, os
+from datetime import date
+
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="SY Comms — Sign Your Proposal",
+    page_icon="✍️",
+    layout="centered",
+)
+
+# ── Branding ──────────────────────────────────────────────────────────────────
+BRAND_PURPLE = "#1f1450"
+BRAND_TEAL   = "#00b5a3"
+
+st.markdown(f"""
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&display=swap');
+  html, body, [class*="css"] {{ font-family: 'Syne', sans-serif; }}
+  .sy-header {{
+      background: {BRAND_PURPLE};
+      color: white;
+      padding: 1.5rem 2rem;
+      border-radius: 12px;
+      margin-bottom: 1.5rem;
+  }}
+  .sy-header h1 {{ margin:0; font-size:1.8rem; font-weight:800; }}
+  .sy-header p  {{ margin:0.3rem 0 0 0; color:{BRAND_TEAL}; font-size:0.95rem; }}
+  .sy-card {{
+      background:#f8f9ff;
+      border-radius:10px;
+      padding:1.2rem 1.5rem;
+      margin-bottom:1rem;
+      border-left:4px solid {BRAND_TEAL};
+  }}
+  .sy-label {{font-size:0.75rem;font-weight:700;text-transform:uppercase;
+              letter-spacing:.08em;color:#aaa;margin-bottom:0.3rem}}
+  .sy-value {{font-size:1.1rem;font-weight:700;color:{BRAND_PURPLE}}}
+  .sy-footer {{text-align:center;color:#aaa;font-size:0.75rem;margin-top:2rem;padding-top:1rem;
+               border-top:1px solid #eee}}
+</style>
+<div class="sy-header">
+  <h1>✍️ SY Comms — Sign Your Proposal</h1>
+  <p>hello@sycomms.co.uk &nbsp;·&nbsp; 01743 667419 &nbsp;·&nbsp; www.sycomms.co.uk</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Load deal data from Gist ──────────────────────────────────────────────────
+params = st.query_params
+gist_id = params.get("gist", "")
+
+if not gist_id:
+    st.warning("No proposal link found. Please use the link provided by your SY Comms consultant.")
+    st.stop()
+
+@st.cache_data(ttl=300)
+def load_gist(gid):
+    r = requests.get(f"https://api.github.com/gists/{gid}", timeout=10)
+    if r.status_code != 200:
+        return None
+    files = r.json().get("files", {})
+    for fname, fdata in files.items():
+        if fname.endswith(".json"):
+            return json.loads(fdata["content"])
+    return None
+
+with st.spinner("Loading your proposal…"):
+    deal = load_gist(gist_id)
+
+if deal is None:
+    st.error("Could not load proposal. The link may have expired or be invalid. "
+             "Please contact your SY Comms consultant.")
+    st.stop()
+
+# ── Pull key deal values ──────────────────────────────────────────────────────
+comp_name    = deal.get("comp_name", deal.get("q_comp_name", ""))
+contact      = deal.get("contact_name", deal.get("q_contact", ""))
+total_mo     = deal.get("total_mo", 0.0)
+hw_rental    = deal.get("hw_monthly_spread", 0.0)
+svc_total    = deal.get("svc_total_sell", 0.0)
+lease_months = deal.get("lease_term", 84)
+install_type = deal.get("install_type", deal.get("q_install_type", ""))
+address      = deal.get("address", deal.get("q_address", ""))
+pdf_b64      = deal.get("pdf_b64", "")
+
+st.markdown(f"### Welcome, {contact or comp_name or 'there'} 👋")
+st.markdown(
+    f"Your SY Comms consultant has prepared a proposal for **{comp_name}**. "
+    "Please review the key details below and sign to confirm your agreement."
+)
+
+# ── Key figures ───────────────────────────────────────────────────────────────
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.markdown(f"""<div class="sy-card">
+      <div class="sy-label">Monthly Lease</div>
+      <div class="sy-value">£{hw_rental:.2f}/mo</div>
+      <div style="font-size:0.78rem;color:#aaa">Hardware + VAT</div>
+    </div>""", unsafe_allow_html=True)
+with col2:
+    st.markdown(f"""<div class="sy-card">
+      <div class="sy-label">Monthly Services</div>
+      <div class="sy-value">£{svc_total:.2f}/mo</div>
+      <div style="font-size:0.78rem;color:#aaa">Licences + BB + VAT</div>
+    </div>""", unsafe_allow_html=True)
+with col3:
+    st.markdown(f"""<div class="sy-card">
+      <div class="sy-label">Agreement Term</div>
+      <div class="sy-value">{lease_months} months</div>
+      <div style="font-size:0.78rem;color:#aaa">{install_type}</div>
+    </div>""", unsafe_allow_html=True)
+
+# ── Download proposal PDF if included ────────────────────────────────────────
+if pdf_b64:
+    pdf_bytes = base64.b64decode(pdf_b64)
+    st.download_button(
+        "📄 Download Your Proposal (PDF)",
+        data=pdf_bytes,
+        file_name=f"SYComms_Proposal_{comp_name.replace(' ','_')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+    st.markdown("---")
+
+# ── Signature capture ─────────────────────────────────────────────────────────
+st.markdown("### ✍️ Sign Below to Confirm")
+st.caption(
+    "By signing below, I/we confirm I have read and agree to the proposal and "
+    "SY Comms Terms & Conditions (https://sycomms.co.uk/terms-conditions)."
+)
+
+sig_name_rs = st.text_input("Full Name", placeholder="Jane Smith", key="rs_sig_name")
+sig_pos_rs  = st.text_input("Position / Title", placeholder="Director", key="rs_sig_pos")
 
 try:
     from streamlit_drawable_canvas import st_canvas
-    CANVAS_OK = True
-except ImportError:
-    CANVAS_OK = False
+    canvas_result = st_canvas(
+        fill_color="rgba(0,0,0,0)",
+        stroke_width=3,
+        stroke_color="#1f1450",
+        background_color="#f8f9ff",
+        update_streamlit=True,
+        return_image_data=True,
+        height=160,
+        width=680,
+        drawing_mode="freedraw",
+        key="rs_canvas",
+    )
+    canvas_ok = True
+except Exception:
+    canvas_ok = False
+    st.info("Signature pad unavailable — please upload a photo of your signature below.")
 
-st.set_page_config(
-    page_title="Sign Documents — Novalink Hardware",
-    page_icon="✍️",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+sig_upload_rs = st.file_uploader("Or upload signature image", type=["png","jpg","jpeg"],
+                                  key="rs_sig_upload", label_visibility="collapsed")
 
-st.markdown("""
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500&display=swap');
-  html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-  .portal-header { background:linear-gradient(135deg,#0d2e4a 0%,#0a3d62 100%);
-    border-radius:14px; padding:1.8rem 2rem; margin-bottom:1.5rem; border:1px solid rgba(0,180,216,0.2); }
-  .portal-header h1 { font-family:'Syne',sans-serif; font-weight:800; font-size:1.6rem; color:#fff; margin:0 0 0.2rem; }
-  .portal-header p  { color:rgba(255,255,255,0.55); margin:0; font-size:0.88rem; }
-  .doc-card { background:#fff; border:1px solid #e0e8f0; border-radius:10px; padding:0.9rem 1.2rem;
-    margin-bottom:0.6rem; display:flex; justify-content:space-between; align-items:center; }
-  .doc-name { font-weight:600; color:#0d2e4a; }
-  .status-badge { background:#e8f8f0; color:#1a7a40; padding:0.2rem 0.7rem; border-radius:20px;
-    font-size:0.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.06em; }
-  .info-block { background:#e8f4fb; border-left:4px solid #00b4d8; border-radius:0 8px 8px 0;
-    padding:0.8rem 1rem; margin:0.8rem 0; font-size:0.88rem; color:#0a3d62; }
-  .success-block { background:#e8f8f0; border-left:4px solid #1a7a40; border-radius:0 8px 8px 0;
-    padding:0.8rem 1rem; margin:0.8rem 0; font-size:0.88rem; color:#1a4a2a; }
-</style>
-""", unsafe_allow_html=True)
+# Save signature bytes
+sig_bytes_rs = st.session_state.get("_rs_sig_bytes")
 
-# ── SECRETS (safe access — shows setup instructions if not configured) ────────
-def _secret(key, default=""):
+_rs_btn_col, _rs_clr_col = st.columns(2)
+with _rs_btn_col:
+    if st.button("✅ Confirm Signature", use_container_width=True, type="primary", key="rs_save_sig"):
+        _saved = False
+        # Try canvas first
+        if canvas_ok:
+            try:
+                _img = canvas_result.image_data if canvas_result else None
+                if _img is not None:
+                    from PIL import Image as _PILImage
+                    _white = _PILImage.new("RGBA", (_img.shape[1], _img.shape[0]), (255,255,255,255))
+                    _white.paste(_PILImage.fromarray(_img.astype("uint8"), "RGBA"),
+                                 mask=_PILImage.fromarray(_img.astype("uint8"), "RGBA").split()[3])
+                    _buf = io.BytesIO()
+                    _white.convert("RGB").save(_buf, format="PNG")
+                    st.session_state["_rs_sig_bytes"] = _buf.getvalue()
+                    _saved = True
+            except Exception:
+                pass
+        # Fallback to upload
+        if not _saved and sig_upload_rs:
+            st.session_state["_rs_sig_bytes"] = sig_upload_rs.read()
+            _saved = True
+        if _saved:
+            sig_bytes_rs = st.session_state["_rs_sig_bytes"]
+            st.rerun()
+        else:
+            st.warning("Please draw or upload a signature first.")
+with _rs_clr_col:
+    if st.button("🗑️ Clear", use_container_width=True, key="rs_clr"):
+        st.session_state.pop("_rs_sig_bytes", None)
+        st.rerun()
+
+if sig_bytes_rs:
+    st.success("✅ Signature confirmed")
     try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
-
-GITHUB_TOKEN = _secret("GITHUB_TOKEN")
-SMTP_HOST    = _secret("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT    = int(_secret("SMTP_PORT", 587))
-SMTP_USER    = _secret("SMTP_USER", "novalinkhardwarepaperwork@gmail.com")
-SMTP_PASS    = _secret("SMTP_PASS")
-FROM_NAME    = _secret("FROM_NAME", "Novalink Hardware")
-
-# Show setup banner if secrets are missing
-if not GITHUB_TOKEN:
-    st.warning("Setup required: add GITHUB_TOKEN, SMTP_USER, SMTP_PASS and FROM_NAME to this app's Streamlit Cloud secrets (Settings > Secrets).")
-
-
-def fetch_gist(gist_id):
-    hdrs = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"} if GITHUB_TOKEN else {}
-    r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=hdrs, timeout=10)
-    return r.json() if r.status_code == 200 else None
-
-
-
-def update_gist(gist_id, files_dict, description=None):
-    hdrs    = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-    payload = {"files": files_dict}
-    if description:
-        payload["description"] = description
-    requests.patch(f"https://api.github.com/gists/{gist_id}", json=payload, headers=hdrs, timeout=15)
-
-
-def get_client_ip():
-    try:
-        for h in ["X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"]:
-            ip = st.context.headers.get(h, "")
-            if ip:
-                return ip.split(",")[0].strip()
+        st.image(sig_bytes_rs, width=250, caption="Your signature")
     except Exception:
         pass
-    return "Not captured"
 
-
-def send_signed_email(to_addr, cc_addr, customer_name, pdf_list, filenames):
-    if not SMTP_PASS:
-        return False, "SMTP not configured."
-    try:
-        msg            = MIMEMultipart()
-        msg["From"]    = f"{FROM_NAME} <{SMTP_USER}>"
-        msg["To"]      = to_addr
-        msg["Subject"] = "Your Signed Documents - Novalink Hardware"
-        if cc_addr:
-            msg["Cc"] = cc_addr
-        msg.attach(MIMEText(f"""<html><body style="font-family:Arial;color:#333;max-width:600px;margin:0 auto">
-          <div style="background:#0d2e4a;padding:20px 30px;border-radius:8px 8px 0 0">
-            <h2 style="color:#fff;margin:0"><span style="color:#00b4d8">Novalink</span> Hardware</h2></div>
-          <div style="background:#f9f9f9;padding:24px 30px;border:1px solid #e0e8e8;border-top:none">
-            <p>Dear {customer_name},</p>
-            <p>Thank you for signing. Your completed signed documents are attached for your records.</p>
-            <p>Kind regards,<br/><strong>{FROM_NAME}</strong></p></div>
-        </body></html>""", "html"))
-        for pdf_bytes, fname in zip(pdf_list, filenames):
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(pdf_bytes)
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f'attachment; filename="{fname}"')
-            msg.attach(part)
-        recipients = [r.strip() for r in [to_addr, cc_addr] if r and r.strip()]
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as srv:
-            srv.ehlo(); srv.starttls(); srv.ehlo()
-            srv.login(SMTP_USER, SMTP_PASS)
-            srv.sendmail(SMTP_USER, recipients, msg.as_string())
-        return True, "sent"
-    except smtplib.SMTPAuthenticationError:
-        return False, "Gmail authentication failed - check App Password in secrets."
-    except Exception as e:
-        return False, str(e)
-
-
-def embed_sig_in_uploaded_pdf(pdf_bytes, sig_bytes, signer_name, company, timestamp, ip_addr=""):
-    """
-    Embed the customer signature into an uploaded PDF by:
-      1. Searching every page for signature-related keywords
-      2. Placing the signature image + metadata just below each match
-      3. Falling back to a stamped block at the bottom of the last page
-    Returns the modified PDF as bytes.
-    """
-    # Keywords that indicate a signature location (case-insensitive search)
-    SIG_KEYWORDS = [
-        "authorised signature", "authorized signature",
-        "customer signature",   "client signature",
-        "signed by",            "signature:",
-        "sign here",            "for and on behalf",
-        "for acme",             "for (company",
-        "signed:",              "authorised signatory",
-    ]
-
-    try:
-        doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
-        sig_fitz  = fitz.open(stream=sig_bytes,  filetype="png")
-        placed    = False
-
-        for page_num in range(len(doc)):
-            page       = doc[page_num]
-            page_text  = page.get_text().lower()
-
-            for keyword in SIG_KEYWORDS:
-                if keyword not in page_text:
-                    continue
-
-                # Find exact screen position of keyword on the page
-                hits = page.search_for(keyword)
-                if not hits:
-                    continue
-
-                for rect in hits:
-                    # Place signature image BELOW the keyword line
-                    x0   = rect.x0
-                    y0   = rect.y1 + 4     # 4pt gap below keyword
-                    w, h = 110, 30         # signature image size in points
-
-                    # Don't overflow the page bottom
-                    page_h = page.rect.height
-                    if y0 + h + 30 > page_h - 20:
-                        y0 = page_h - h - 50
-
-                    img_rect = fitz.Rect(x0, y0, x0 + w, y0 + h)
-                    page.insert_image(img_rect, stream=sig_bytes, keep_proportion=True)
-
-                    # Metadata lines below the image
-                    meta_y = y0 + h + 3
-                    page.insert_text((x0, meta_y),      signer_name,
-                                     fontsize=8, color=(0.15, 0.15, 0.15))
-                    page.insert_text((x0, meta_y + 10), company or "",
-                                     fontsize=7, color=(0.4, 0.4, 0.4))
-                    page.insert_text((x0, meta_y + 18), timestamp,
-                                     fontsize=7, color=(0.4, 0.4, 0.4))
-                    if ip_addr and ip_addr not in ("Not captured", ""):
-                        page.insert_text((x0, meta_y + 26), f"IP: {ip_addr}",
-                                         fontsize=6, color=(0.6, 0.6, 0.6))
-                    placed = True
-
-        if not placed:
-            # ── Fallback: stamp a signature block at the bottom of the last page ──
-            page   = doc[-1]
-            page_w = page.rect.width
-            page_h = page.rect.height
-            x0     = 50
-            y0     = page_h - 110
-
-            # Horizontal rule
-            page.draw_line((x0, y0), (x0 + 200, y0),
-                            color=(0.7, 0.7, 0.7), width=0.5)
-            page.insert_text((x0, y0 + 8), "Electronically Signed:",
-                              fontsize=8, color=(0.3, 0.3, 0.3))
-
-            img_rect = fitz.Rect(x0, y0 + 12, x0 + 110, y0 + 42)
-            page.insert_image(img_rect, stream=sig_bytes, keep_proportion=True)
-
-            meta_y = y0 + 46
-            page.insert_text((x0, meta_y),      signer_name,
-                              fontsize=8, color=(0.15, 0.15, 0.15))
-            page.insert_text((x0, meta_y + 10), company or "",
-                              fontsize=7, color=(0.4, 0.4, 0.4))
-            page.insert_text((x0, meta_y + 18), timestamp,
-                              fontsize=7, color=(0.4, 0.4, 0.4))
-            if ip_addr and ip_addr not in ("Not captured", ""):
-                page.insert_text((x0, meta_y + 26), f"IP: {ip_addr}",
-                                  fontsize=6, color=(0.6, 0.6, 0.6))
-
-        result = doc.tobytes()
-        doc.close()
-        return result, placed
-
-    except Exception as e:
-        # If anything goes wrong with PDF manipulation, return the original unchanged
-        return pdf_bytes, False
-
-
-def build_certificate(sig_bytes, sig_name, company, timestamp, ip_addr, doc_bytes_for_hash):
-    """Build a standalone Certificate of Completion PDF."""
-    envelope_id = str(uuid.uuid4()).upper()
-    doc_hash    = hashlib.sha256(doc_bytes_for_hash).hexdigest().upper()
-
-    cert = FPDF()
-    cert.set_margins(15, 15, 15)
-    cert.add_page()
-
-    # Header
-    cert.set_fill_color(13, 46, 74)
-    cert.rect(0, 0, 210, 22, "F")
-    cert.set_font("Helvetica", "B", 13)
-    cert.set_text_color(255, 255, 255)
-    cert.set_y(5)
-    cert.cell(0, 6, "CERTIFICATE OF COMPLETION", ln=True, align="C")
-    cert.set_font("Helvetica", "", 8)
-    cert.cell(0, 5, "Novalink Hardware  |  Electronic Signing Record", ln=True, align="C")
-    cert.set_fill_color(0, 180, 216)
-    cert.rect(0, 22, 210, 1.5, "F")
-    cert.set_text_color(0, 0, 0)
-    cert.ln(8)
-
-    def sec(t):
-        cert.set_font("Helvetica", "B", 9)
-        cert.set_fill_color(220, 235, 245)
-        cert.set_text_color(13, 46, 74)
-        cert.cell(0, 6, f"  {t}", fill=True, ln=True)
-        cert.set_text_color(0, 0, 0)
-
-    def kv(l, v, color=(0,0,0)):
-        cert.set_font("Helvetica", "B", 8); cert.set_text_color(100, 100, 100)
-        cert.cell(52, 5.5, l, ln=False)
-        cert.set_font("Helvetica", "", 8); cert.set_text_color(*color)
-        cert.cell(0, 5.5, str(v)[:80], ln=True)
-        cert.set_text_color(0, 0, 0)
-
-    sec("Envelope Summary")
-    cert.ln(1)
-    kv("Envelope ID:", envelope_id)
-    kv("Status:", "COMPLETED", color=(0, 140, 70))
-    kv("Originator:", FROM_NAME)
-    kv("Time Zone:", "(UTC+00:00) Dublin, Edinburgh, Lisbon, London")
-    kv("Originator Email:", SMTP_USER)
-    cert.ln(4)
-
-    sec("Signer Events")
-    cert.ln(1)
-    cert.set_font("Helvetica", "B", 8)
-    cert.cell(65, 5.5, "Signer Details", border="B", ln=False)
-    cert.cell(65, 5.5, "Signature", border="B", ln=False)
-    cert.cell(0,  5.5, "Timestamps", border="B", ln=True)
-
-    y0 = cert.get_y()
-    # Signature image in middle column
-    if sig_bytes:
-        try:
-            cert.image(io.BytesIO(sig_bytes), x=68, y=y0, w=58, h=18)
-        except Exception:
-            pass
-    # Right column timestamps
-    cert.set_xy(cert.l_margin + 135, y0)
-    cert.set_font("Helvetica", "", 7.5)
-    cert.cell(0, 5, f"Sent:   {timestamp}", ln=True)
-    cert.set_xy(cert.l_margin + 135, y0 + 5)
-    cert.cell(0, 5, f"Viewed: {timestamp}", ln=True)
-    cert.set_xy(cert.l_margin + 135, y0 + 10)
-    cert.cell(0, 5, f"Signed: {timestamp}", ln=True)
-    # Left column signer details
-    cert.set_y(y0 + 1)
-    cert.set_font("Helvetica", "B", 8)
-    cert.cell(65, 5, sig_name or "Customer", ln=True)
-    cert.set_x(cert.l_margin)
-    cert.set_font("Helvetica", "", 8)
-    cert.cell(65, 5, company or "", ln=True)
-    cert.set_x(cert.l_margin)
-    cert.set_font("Helvetica", "I", 7.5)
-    cert.set_text_color(80, 80, 80)
-    cert.cell(65, 5, f"IP: {ip_addr}", ln=True)
-    cert.set_x(cert.l_margin)
-    cert.cell(65, 5, "Method: Hand-drawn / photo", ln=True)
-    cert.set_text_color(0, 0, 0)
-    cert.ln(4)
-
-    sec("Carbon Copy Events")
-    cert.ln(1)
-    cert.set_font("Helvetica", "B", 8)
-    cert.cell(65, 5.5, "Recipient", border="B", ln=False)
-    cert.cell(65, 5.5, "Status", border="B", ln=False)
-    cert.cell(0,  5.5, "Timestamps", border="B", ln=True)
-    cert.set_font("Helvetica", "", 8)
-    cert.cell(65, 5.5, SMTP_USER, ln=False)
-    cert.cell(65, 5.5, "COPIED", ln=False)
-    cert.cell(0,  5.5, timestamp, ln=True)
-    cert.ln(4)
-
-    sec("Envelope Summary Events")
-    cert.ln(1)
-    cert.set_font("Helvetica", "B", 8)
-    for h in ["Event", "Status", "Timestamp"]:
-        w = 65 if h != "Timestamp" else 0
-        cert.cell(w, 5.5, h, border="B", ln=(1 if h == "Timestamp" else 0))
-    cert.set_font("Helvetica", "", 8)
-    for ev, st_txt in [("Envelope Sent","Hashed / Encrypted"),("Certified Delivered","Security Checked"),
-                        ("Signing Complete","Security Checked"),("Completed","Security Checked")]:
-        cert.cell(65, 5.5, ev, ln=False)
-        cert.cell(65, 5.5, st_txt, ln=False)
-        cert.cell(0,  5.5, timestamp, ln=True)
-    cert.ln(4)
-
-    sec("Document Integrity")
-    cert.ln(2)
-    kv("Document Hash (SHA-256):", doc_hash[:40])
-    kv("Signing Method:", "Remote electronic signature via Novalink Hardware Signing Portal")
-    kv("Platform:", "Novalink Hardware Remote Signing Portal - Streamlit Cloud")
-    kv("Full Envelope ID:", envelope_id)
-    cert.ln(4)
-
-    cert.set_font("Helvetica", "I", 7.5)
-    cert.set_text_color(120, 120, 120)
-    cert.set_x(cert.l_margin)
-    cert.multi_cell(cert.epw, 4,
-        "This certificate confirms that the above-named signer reviewed and electronically signed "
-        "the attached documentation. The timestamp, IP address and signature were recorded at the "
-        "moment of signing. This constitutes a valid electronic agreement under the Electronic "
-        "Communications Act 2000 and eIDAS Regulation (EU) 910/2014.")
-
-    cert.set_y(-15)
-    cert.set_font("Helvetica", "I", 7)
-    cert.set_text_color(150, 150, 150)
-    cert.cell(0, 5, "Novalink Hardware | All figures exclude VAT | This document is confidential", align="C")
-
-    return bytes(cert.output())
-
-
-# ── MAIN ROUTING ──────────────────────────────────────────────────────────────
-gist_id = st.query_params.get("gist", "")
-
-if not gist_id:
-    st.markdown("""<div class="portal-header">
-      <h1>✍️ Novalink Hardware Signing Portal</h1>
-      <p>This page is accessed via a unique link sent to you by Novalink Hardware.</p>
-    </div>""", unsafe_allow_html=True)
-    st.warning("No signing session found in this link. Please check the link you received or contact Novalink Hardware.")
-    st.stop()
-
-with st.spinner("Loading your documents..."):
-    gist = fetch_gist(gist_id)
-
-if not gist:
-    st.error("Could not load the signing session. The link may be invalid or expired. Please contact Novalink Hardware.")
-    st.stop()
-
-try:
-    session = json.loads(gist["files"].get("session.json", {}).get("content", "{}"))
-except Exception:
-    st.error("Session data is corrupted. Please contact Novalink Hardware.")
-    st.stop()
-
-if session.get("status") == "signed":
-    st.markdown("""<div class="portal-header">
-      <h1>✅ Already Signed</h1>
-      <p>These documents have already been signed. Signed copies were emailed at the time of signing.</p>
-    </div>""", unsafe_allow_html=True)
-    st.info("If you need another copy, please contact Novalink Hardware directly.")
-    st.stop()
-
-customer_name  = session.get("customer_name", "Customer")
-customer_email = session.get("customer_email", "")
-sender_email   = session.get("sender_email", "")
-custom_message = session.get("message", "")
-
-# ── HEADER ────────────────────────────────────────────────────────────────────
-st.markdown(f"""<div class="portal-header">
-  <h1>✍️ Documents Ready for Your Signature</h1>
-  <p>Prepared for <strong>{customer_name}</strong> &nbsp;·&nbsp; Please review each document below, then sign at the bottom.</p>
-</div>""", unsafe_allow_html=True)
-
-if custom_message:
-    st.markdown(f'<div class="info-block">💬 Message: <em>{custom_message}</em></div>', unsafe_allow_html=True)
-
-# ── DOCUMENTS ────────────────────────────────────────────────────────────────
-st.markdown("### 📄 Your Documents")
-doc_files = sorted([(k, v) for k, v in gist["files"].items()
-                    if k.startswith("doc_") and k.endswith(".b64")])
-doc_data  = []
-
-for key, file_info in doc_files:
-    try:
-        pdf_bytes    = base64.b64decode(file_info["content"])
-        parts        = key.split("_", 2)
-        display_name = parts[2].replace(".b64", "") if len(parts) == 3 else key
-        doc_data.append((display_name, pdf_bytes))
-
-        c1, c2 = st.columns([5, 1])
-        with c1:
-            st.markdown(f'<div class="doc-card"><span class="doc-name">📄 {display_name}</span><span class="status-badge">Ready to sign</span></div>',
-                        unsafe_allow_html=True)
-        with c2:
-            st.download_button("⬇️ Download", data=pdf_bytes, file_name=display_name,
-                               mime="application/pdf", use_container_width=True, key=f"dl_{key}")
-
-        with st.expander(f"👁️ Preview: {display_name}"):
-            b64_display = base64.b64encode(pdf_bytes).decode()
-            st.markdown(f'<iframe src="data:application/pdf;base64,{b64_display}" width="100%" height="500px" type="application/pdf"></iframe>',
-                        unsafe_allow_html=True)
-    except Exception:
-        st.warning(f"Could not load: {key}")
-
-if not doc_data:
-    st.error("No documents found in this session.")
-    st.stop()
-
-st.divider()
-
-# ── SIGNATURE ─────────────────────────────────────────────────────────────────
-st.markdown("### ✍️ Your Signature")
-sig_method = st.radio("How would you like to sign?",
-                      ["Draw on screen", "Upload a photo of your signature"],
-                      horizontal=True)
-
-if sig_method == "Draw on screen":
-    if not CANVAS_OK:
-        st.warning("Drawing pad unavailable. Please use Upload photo instead.")
-    else:
-        with st.container(border=True):
-            st.caption("Draw your signature below using mouse, finger or stylus.")
-            cr = st_canvas(fill_color="rgba(0,0,0,0)", stroke_width=3,
-                           stroke_color="#000000", background_color="#EAF4FB",
-                           update_streamlit=True, height=180, width=510,
-                           drawing_mode="freedraw", display_toolbar=True, key="sig_canvas")
-        if cr.image_data is not None:
-            if cr.image_data[:,:,3].sum() > 500:
-                img = PILImage.fromarray(cr.image_data.astype("uint8"), "RGBA").convert("RGB")
-                buf = io.BytesIO(); img.save(buf, "PNG")
-                st.session_state["_psig"] = buf.getvalue()
-                st.success("Signature captured")
-            else:
-                st.session_state.pop("_psig", None)
-else:
-    f = st.file_uploader("Upload signature image", type=["jpg","jpeg","png"], label_visibility="collapsed")
-    if f:
-        img = PILImage.open(f).convert("RGB").resize((400, 120), PILImage.LANCZOS)
-        buf = io.BytesIO(); img.save(buf, "PNG")
-        st.session_state["_psig"] = buf.getvalue()
-        st.image(f, width=280, caption="Preview")
-        st.success("Signature uploaded")
-
-sig_bytes = st.session_state.get("_psig")
-
-st.markdown("### ✅ Confirm Your Details")
-c1, c2 = st.columns(2)
-with c1:
-    confirm_name = st.text_input("Full name", placeholder="Jane Smith", key="cname")
-with c2:
-    confirm_role = st.text_input("Role / Position", placeholder="Managing Director", key="crole")
-
-agree = st.checkbox("I confirm I have read all the above documents and agree to sign them electronically.")
-
-st.markdown("")
-can_sign = bool(sig_bytes and confirm_name and agree)
-
-if not can_sign:
-    missing = [x for cond, x in [(not sig_bytes, "signature"), (not confirm_name, "full name"), (not agree, "agreement tick")] if cond]
-    if missing:
-        st.caption(f"Still needed: {', '.join(missing)}")
-
-if st.button("✍️  Sign & Send Documents", type="primary", use_container_width=True, disabled=not can_sign):
-    with st.spinner("Signing and sending..."):
-        ts         = datetime.now().strftime("%d/%m/%Y  %H:%M")
-        ip         = get_client_ip()
-        signer_str = f"{confirm_name} - {confirm_role}" if confirm_role else confirm_name
-
-        # Embed signature into each uploaded PDF
-        signed_docs  = []
-        detect_notes = []
-        for doc_name, doc_bytes in doc_data:
-            signed_bytes, auto_placed = embed_sig_in_uploaded_pdf(
-                doc_bytes, sig_bytes, signer_str, customer_name, ts, ip
-            )
-            signed_docs.append((doc_name, signed_bytes))
-            detect_notes.append(
-                f"- **{doc_name}**: signature {'auto-placed at detected signature block' if auto_placed else 'stamped at bottom of last page (no signature block found)'}"
-            )
-
-        # Build Certificate of Completion
-        cert_bytes = build_certificate(sig_bytes, signer_str, customer_name, ts, ip, doc_data[0][1])
-        cert_name  = f"Certificate_of_Completion_{customer_name.replace(' ','_')}.pdf"
-
-        all_pdf_bytes = [d[1] for d in signed_docs] + [cert_bytes]
-        all_names     = [d[0] for d in signed_docs] + [cert_name]
-
-        # CC both the sender and Novalink info address so you always get a copy
-        cc_addresses = ", ".join(filter(None, [sender_email, "info@novalinkhardware.co.uk"]))
-        ok, msg = send_signed_email(customer_email, cc_addresses, customer_name, all_pdf_bytes, all_names)
-
-        update_gist(gist_id,
-            {"session.json": {"content": json.dumps({**session,
-                "status": "signed", "signed_at": datetime.now().isoformat(),
-                "signed_by_name": signer_str, "signed_by_ip": ip}, indent=2)}},
-            description=f"SIGNED - Novalink - {customer_name}")
-
-        st.session_state.pop("_psig", None)
-
-    if ok:
-        st.markdown(f"""<div class="success-block">
-          ✅ <strong>Signed successfully!</strong><br/>
-          All documents and your Certificate of Completion have been emailed to <strong>{customer_email}</strong>.<br/>
-          Signed: {ts} &nbsp;|&nbsp; Reference: {gist_id[:12].upper()}
-        </div>""", unsafe_allow_html=True)
-        with st.expander("📍 Signature placement details"):
-            for note in detect_notes:
-                st.markdown(note)
-        st.balloons()
-    else:
-        st.error(f"Signing recorded but email failed: {msg}")
-
-    st.download_button("📥 Download Certificate of Completion", data=cert_bytes,
-                       file_name=cert_name, mime="application/pdf", use_container_width=True)
-    for doc_name, signed_bytes in signed_docs:
-        st.download_button(f"📥 Download signed: {doc_name}", data=signed_bytes,
-                           file_name=f"SIGNED_{doc_name}", mime="application/pdf",
-                           use_container_width=True, key=f"dl_signed_{doc_name}")
+# ── Submit ────────────────────────────────────────────────────────────────────
+st.markdown("---")
+_ready = bool(sig_bytes_rs and sig_name_rs)
+if not _ready:
+    st.caption("Please complete your name and signature above to submit.")
+
+if st.button("📨 Submit Signed Agreement", use_container_width=True,
+             type="primary", disabled=not _ready, key="rs_submit"):
+    # Build a signed confirmation record
+    record = {
+        "comp_name":   comp_name,
+        "signed_by":   sig_name_rs,
+        "position":    sig_pos_rs,
+        "signed_date": str(date.today()),
+        "gist_id":     gist_id,
+        "sig_b64":     base64.b64encode(sig_bytes_rs).decode() if sig_bytes_rs else "",
+    }
+    # Optionally POST back to a webhook / email via SMTP
+    # For now, show confirmation and provide a downloadable receipt
+    st.balloons()
+    st.success(f"🎉 Thank you, {sig_name_rs}! Your agreement has been submitted.")
+    st.markdown(f"""
+    <div class="sy-card" style="border-left-color:#1a7a40">
+      <strong>Reference:</strong> {comp_name} — signed {date.today().strftime('%d %B %Y')}<br>
+      <strong>Signed by:</strong> {sig_name_rs} ({sig_pos_rs})<br>
+      <strong>Your SY Comms consultant will be in touch shortly.</strong>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown(
+        "📞 **Questions?** Call us on 01743 667419 or email sales@sycomms.co.uk"
+    )
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+st.markdown(f"""
+<div class="sy-footer">
+  SY Comms Ltd &nbsp;·&nbsp; Suite C Jupiter House, Shrewsbury Business Park, SY2 6LG<br>
+  Registered in England No. 15722588 &nbsp;·&nbsp; VAT No. 467 8165 48<br>
+  www.sycomms.co.uk
+</div>
+""", unsafe_allow_html=True)
