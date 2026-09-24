@@ -55,14 +55,21 @@ st.markdown(f"""
 params  = st.query_params
 gist_id = params.get("gist", "")
 
-# Try to capture client IP via Streamlit internals
+# Try to capture client IP via multiple Streamlit methods
 _client_ip = "Not captured"
 try:
     from streamlit.runtime.scriptrunner import get_script_run_ctx as _get_ctx
     from streamlit.runtime import get_instance as _get_rt
     _ctx = _get_ctx()
     if _ctx:
-        _client_ip = _get_rt().get_client(_ctx.session_id).request.remote_ip or "Not captured"
+        _client = _get_rt().get_client(_ctx.session_id)
+        # Try X-Forwarded-For first (Streamlit Cloud proxy)
+        _client_ip = (
+            _client.request.headers.get("X-Forwarded-For","").split(",")[0].strip()
+            or _client.request.headers.get("X-Real-IP","")
+            or getattr(_client.request, "remote_ip", None)
+            or "Not captured"
+        )
 except Exception:
     pass
 
@@ -500,25 +507,33 @@ if st.session_state.get("_rs_submitted"):
                 sp.cell(0,3.5,_ss(f"Signed: {signer}  |  {ts}"),ln=True)
                 return bytes(sp.output())
 
-            def _find_signed_y(page):
-                """Find y position (in mm) of the LOWEST 'Signed:' on a page."""
-                PAGE_H_PT = float(page.mediabox.height)  # points, origin bottom-left
+            def _find_sig_line_y(page):
+                """Find y (mm from top) of a blank signature line '______' near 'Signed:'."""
+                PAGE_H_PT = float(page.mediabox.height)
                 _hits = []
                 def _visit(text, cm, tm, fd, fs):
-                    if text and "signed" in text.lower():
-                        # tm[5] is y in points from bottom; convert to mm from top
+                    if not text: return
+                    t = text.strip()
+                    # Only match explicit blank signature lines — not body text
+                    _is_sig = (
+                        t.lower().startswith("signed:") and "_" in t
+                        or t.lower() in ("signed:", "signature:")
+                        or (t.lower().startswith("authorised signature") and "_" in t)
+                    )
+                    if _is_sig:
                         y_pt = tm[5]
                         y_mm = (PAGE_H_PT - y_pt) / 2.8346
-                        _hits.append(y_mm)
+                        if 50 < y_mm < 270:  # ignore header/footer areas
+                            _hits.append(y_mm)
                 try:
                     page.extract_text(visitor_text=_visit)
                 except Exception:
                     pass
-                # Return lowest instance (highest y_mm = furthest down the page)
-                return max(_hits) - 2 if _hits else None  # 2mm above the text
+                return max(_hits) - 1 if _hits else None
 
-            _SIG_MARKERS = ("signed:", "for ", "authorised signatory",
-                            "i/we confirm", "i confirm", "customer signature")
+            # Only stamp pages with genuine blank signature lines
+            _SIG_MARKERS = ("signed: ___", "signature: ___", "authorised signature: ___",
+                            "signed:___", "signature:___")
 
             writer = PdfWriter()
             for _doc in _orig_docs:
@@ -526,13 +541,14 @@ if st.session_state.get("_rs_submitted"):
                 for page in reader.pages:
                     try:
                         page_text = page.extract_text() or ""
-                        needs_sig = any(m in page_text.lower() for m in _SIG_MARKERS)
+                        pt_lower  = page_text.lower().replace(" ", "")
+                        needs_sig = any(m.replace(" ","") in pt_lower for m in _SIG_MARKERS)
                     except Exception:
-                        needs_sig = False; page_text = ""
+                        needs_sig = False
                     if needs_sig:
-                        y_pos = _find_signed_y(page)
-                        if y_pos is None or y_pos > 270:
-                            y_pos = 255  # fallback: near bottom
+                        y_pos = _find_sig_line_y(page)
+                        if y_pos is None:
+                            y_pos = 255  # safe fallback
                         stamp_bytes = _make_stamp_at(sig_bytes_rs, sig_name_rs, _ts_stamp, y_pos)
                         stamp_reader = PdfReader(io.BytesIO(stamp_bytes))
                         page.merge_page(stamp_reader.pages[0])
