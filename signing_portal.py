@@ -60,34 +60,50 @@ if not gist_id:
     st.stop()
 
 @st.cache_data(ttl=300)
-def load_gist(gid):
-    token = st.secrets.get("GITHUB_TOKEN", "") if hasattr(st, "secrets") else ""
-    hdrs  = {"Authorization": f"token {token}"} if token else {}
-    r = requests.get(f"https://api.github.com/gists/{gid}", headers=hdrs, timeout=10)
+def load_gist(gid, token=""):
+    """Fetch deal data from a private GitHub Gist."""
+    hdrs = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"} if token else {}
+    try:
+        r = requests.get(f"https://api.github.com/gists/{gid}", headers=hdrs, timeout=15)
+    except Exception as e:
+        return None, f"Network error: {e}"
+    if r.status_code == 404:
+        return None, "Gist not found — link may have expired."
+    if r.status_code == 401:
+        return None, "Authentication error — portal not configured correctly."
     if r.status_code != 200:
-        return None
+        return None, f"GitHub error {r.status_code}"
     files = r.json().get("files", {})
-    # Prefer session.json which contains the full deal data
-    for fname in ("session.json", ):
+    # Prefer session.json
+    for fname in ("session.json",):
         if fname in files:
             raw = files[fname]
-            content_url = raw.get("raw_url", "")
-            if raw.get("truncated") and content_url:
-                r2 = requests.get(content_url, headers=hdrs, timeout=10)
-                return json.loads(r2.text)
-            return json.loads(raw["content"])
-    # Fallback: first JSON file
+            if raw.get("truncated"):
+                r2 = requests.get(raw["raw_url"], headers=hdrs, timeout=15)
+                return json.loads(r2.text), None
+            return json.loads(raw["content"]), None
+    # Fallback: any JSON file
     for fname, fdata in files.items():
         if fname.endswith(".json"):
-            return json.loads(fdata["content"])
-    return None
+            return json.loads(fdata["content"]), None
+    return None, "No deal data found in this link."
+
+# Read token outside the cached function
+_gh_token = ""
+if hasattr(st, "secrets"):
+    try:
+        _gh_token = st.secrets.get("GITHUB_TOKEN", "")
+    except Exception:
+        pass
 
 with st.spinner("Loading your proposal…"):
-    deal = load_gist(gist_id)
+    deal, _err = load_gist(gist_id, token=_gh_token)
 
 if deal is None:
-    st.error("Could not load proposal. The link may have expired or be invalid. "
-             "Please contact your SY Comms consultant.")
+    st.error(f"Could not load proposal: {_err or 'Link may have expired.'} "
+             "Please contact your SY Comms consultant on 01743 667419.")
+    if not _gh_token:
+        st.warning("⚙️ Portal not yet configured — GITHUB_TOKEN missing from Streamlit secrets.")
     st.stop()
 
 # ── Pull key deal values ──────────────────────────────────────────────────────
