@@ -239,31 +239,133 @@ _ready = bool(sig_bytes_rs and sig_name_rs)
 if not _ready:
     st.caption("Please complete your name and signature above to submit.")
 
+def _build_receipt_pdf(comp, signer, position, sig_img_bytes, hw, svc, term_label, install):
+    """Generate a signed receipt PDF."""
+    from fpdf import FPDF
+    p = FPDF(); p.add_page(); p.set_auto_page_break(True, margin=15)
+    # Header
+    p.set_fill_color(31,20,80); p.rect(0,0,210,30,"F")
+    p.set_fill_color(0,181,163); p.rect(0,30,210,2,"F")
+    p.set_text_color(255,255,255); p.set_font("Helvetica","B",16)
+    p.set_y(8); p.cell(0,8,"SY COMMS LTD — Signed Agreement Receipt",ln=True,align="C")
+    p.set_font("Helvetica","",8); p.set_text_color(0,181,163)
+    p.cell(0,6,"hello@sycomms.co.uk  |  01743 667419  |  www.sycomms.co.uk",ln=True,align="C")
+    p.set_text_color(0,0,0); p.set_y(38)
+    # Deal summary
+    p.set_font("Helvetica","B",10); p.set_fill_color(245,247,255)
+    p.cell(0,7,f"  Agreement Summary — {comp}",fill=True,ln=True)
+    p.set_font("Helvetica","",9)
+    rows = [("Company",comp),("Signed by",f"{signer} ({position})"),
+            ("Date",date.today().strftime("%d %B %Y")),
+            ("Monthly Lease",f"GBP {hw:.2f}/mo"),
+            ("Monthly Services",f"GBP {svc:.2f}/mo"),
+            ("Total Monthly",f"GBP {hw+svc:.2f}/mo (excl. VAT)"),
+            ("Agreement Term",term_label),("Installation",install)]
+    for i,(lbl,val) in enumerate(rows):
+        p.set_fill_color(248,249,255) if i%2==0 else p.set_fill_color(255,255,255)
+        p.cell(60,6,f"  {lbl}:",fill=True,ln=False)
+        p.cell(0,6,str(val),fill=True,ln=True)
+    p.ln(6)
+    # Signature
+    p.set_font("Helvetica","B",10); p.set_fill_color(245,247,255)
+    p.cell(0,7,"  Customer Signature",fill=True,ln=True)
+    p.ln(2)
+    if sig_img_bytes:
+        try:
+            import tempfile,os
+            with tempfile.NamedTemporaryFile(suffix=".png",delete=False) as tf:
+                tf.write(sig_img_bytes); tp=tf.name
+            p.image(tp,x=p.l_margin,y=p.get_y(),w=80,h=22)
+            os.unlink(tp); p.ln(24)
+        except Exception: p.ln(6)
+    p.set_font("Helvetica","",9)
+    p.cell(0,5,f"Signed: {signer}",ln=True)
+    p.cell(0,5,f"Position: {position}",ln=True)
+    p.cell(0,5,f"Date: {date.today().strftime('%d %B %Y')}",ln=True)
+    p.ln(6)
+    p.set_font("Helvetica","I",7); p.set_text_color(130,130,130)
+    p.multi_cell(0,4,"By submitting this form, the signatory confirms agreement to the SY Comms "
+                 "proposal and Terms & Conditions available at https://sycomms.co.uk/terms-conditions",align="C")
+    p.set_text_color(0,0,0)
+    return bytes(p.output())
+
+def _email_receipt(pdf_bytes, comp, signer, signed_date):
+    """Email the signed receipt to SY Comms sales team."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email.mime.text import MIMEText
+    from email import encoders
+    secrets = st.secrets if hasattr(st,"secrets") else {}
+    host  = secrets.get("SMTP_HOST","smtp.office365.com")
+    port  = int(secrets.get("SMTP_PORT",587))
+    user  = secrets.get("SMTP_USER","sales@sycomms.co.uk")
+    pwd   = secrets.get("SMTP_PASS","")
+    notify = secrets.get("NOTIFY_EMAIL","sales@sycomms.co.uk")
+    if not pwd:
+        return False,"SMTP password not configured in portal secrets."
+    msg = MIMEMultipart()
+    msg["From"]    = f"SY Comms Portal <{user}>"
+    msg["To"]      = notify
+    msg["Subject"] = f"✅ Signed Agreement — {comp} ({signed_date})"
+    body = ("A customer has signed their agreement via the remote portal.\n\n"
+            f"Company: {comp}\nSigned by: {signer}\nDate: {signed_date}\n\n"
+            "Please find the signed receipt attached.")
+    msg.attach(MIMEText(body, "plain"))
+    att = MIMEBase("application","pdf")
+    att.set_payload(pdf_bytes)
+    encoders.encode_base64(att)
+    att.add_header("Content-Disposition","attachment",
+                   filename=f"Signed_Receipt_{comp.replace(' ','_')}.pdf")
+    msg.attach(att)
+    try:
+        with smtplib.SMTP(host,port) as srv:
+            srv.ehlo(); srv.starttls(); srv.ehlo()
+            srv.login(user,pwd)
+            srv.sendmail(user,notify,msg.as_string())
+        return True,"Sent"
+    except Exception as e:
+        return False,str(e)
+
 if st.button("📨 Submit Signed Agreement", use_container_width=True,
              type="primary", disabled=not _ready, key="rs_submit"):
-    # Build a signed confirmation record
-    record = {
-        "comp_name":   comp_name,
-        "signed_by":   sig_name_rs,
-        "position":    sig_pos_rs,
-        "signed_date": str(date.today()),
-        "gist_id":     gist_id,
-        "sig_b64":     base64.b64encode(sig_bytes_rs).decode() if sig_bytes_rs else "",
-    }
-    # Optionally POST back to a webhook / email via SMTP
-    # For now, show confirmation and provide a downloadable receipt
+    signed_date = date.today().strftime("%d %B %Y")
+    # Build receipt PDF
+    receipt_pdf = _build_receipt_pdf(
+        comp=comp_name, signer=sig_name_rs, position=sig_pos_rs,
+        sig_img_bytes=sig_bytes_rs,
+        hw=hw_rental, svc=svc_total, term_label=lease_label, install=install_type
+    )
+    # Email to SY Comms
+    _email_ok, _email_msg = _email_receipt(receipt_pdf, comp_name, sig_name_rs, signed_date)
+    st.session_state["_rs_receipt_pdf"]  = receipt_pdf
+    st.session_state["_rs_receipt_name"] = f"SYComms_Signed_{comp_name.replace(' ','_')}_{signed_date.replace(' ','_')}.pdf"
+    st.session_state["_rs_submitted"]    = True
+    st.session_state["_rs_email_ok"]     = _email_ok
+    st.session_state["_rs_signer"]       = sig_name_rs
+    st.rerun()
+
+if st.session_state.get("_rs_submitted"):
+    signer_display = st.session_state.get("_rs_signer","")
     st.balloons()
-    st.success(f"🎉 Thank you, {sig_name_rs}! Your agreement has been submitted.")
+    st.success(f"🎉 Thank you, {signer_display}! Your agreement has been submitted.")
     st.markdown(f"""
     <div class="sy-card" style="border-left-color:#1a7a40">
       <strong>Reference:</strong> {comp_name} — signed {date.today().strftime('%d %B %Y')}<br>
-      <strong>Signed by:</strong> {sig_name_rs} ({sig_pos_rs})<br>
+      <strong>Signed by:</strong> {signer_display}<br>
       <strong>Your SY Comms consultant will be in touch shortly.</strong>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown(
-        "📞 **Questions?** Call us on 01743 667419 or email sales@sycomms.co.uk"
-    )
+    </div>""", unsafe_allow_html=True)
+    _receipt = st.session_state.get("_rs_receipt_pdf")
+    _rname   = st.session_state.get("_rs_receipt_name","signed_receipt.pdf")
+    if _receipt:
+        st.download_button("📄 Download Your Signed Copy",data=_receipt,
+                           file_name=_rname,mime="application/pdf",
+                           use_container_width=True,key="rs_dl_receipt")
+    if st.session_state.get("_rs_email_ok"):
+        st.caption("✅ A copy has been sent to the SY Comms team.")
+    else:
+        st.caption("📋 Your agreement has been recorded. The SY Comms team will follow up shortly.")
+    st.markdown("📞 **Questions?** Call us on 01743 667419 or email sales@sycomms.co.uk")
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
