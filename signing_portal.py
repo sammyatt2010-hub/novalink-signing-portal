@@ -242,29 +242,30 @@ if not _ready:
 def _build_receipt_pdf(comp, signer, position, sig_img_bytes, hw, svc, term_label, install):
     """Generate a signed receipt PDF."""
     from fpdf import FPDF
+    def _s(t): return str(t or "").encode("latin-1",errors="replace").decode("latin-1")
     p = FPDF(); p.add_page(); p.set_auto_page_break(True, margin=15)
     # Header
     p.set_fill_color(31,20,80); p.rect(0,0,210,30,"F")
     p.set_fill_color(0,181,163); p.rect(0,30,210,2,"F")
     p.set_text_color(255,255,255); p.set_font("Helvetica","B",16)
-    p.set_y(8); p.cell(0,8,"SY COMMS LTD — Signed Agreement Receipt",ln=True,align="C")
+    p.set_y(8); p.cell(0,8,"SY COMMS LTD - Signed Agreement Receipt",ln=True,align="C")
     p.set_font("Helvetica","",8); p.set_text_color(0,181,163)
     p.cell(0,6,"hello@sycomms.co.uk  |  01743 667419  |  www.sycomms.co.uk",ln=True,align="C")
     p.set_text_color(0,0,0); p.set_y(38)
     # Deal summary
     p.set_font("Helvetica","B",10); p.set_fill_color(245,247,255)
-    p.cell(0,7,f"  Agreement Summary — {comp}",fill=True,ln=True)
+    p.cell(0,7,_s(f"  Agreement Summary - {comp}"),fill=True,ln=True)
     p.set_font("Helvetica","",9)
-    rows = [("Company",comp),("Signed by",f"{signer} ({position})"),
+    rows = [("Company",_s(comp)),("Signed by",_s(f"{signer} ({position})")),
             ("Date",date.today().strftime("%d %B %Y")),
             ("Monthly Lease",f"GBP {hw:.2f}/mo"),
             ("Monthly Services",f"GBP {svc:.2f}/mo"),
             ("Total Monthly",f"GBP {hw+svc:.2f}/mo (excl. VAT)"),
-            ("Agreement Term",term_label),("Installation",install)]
+            ("Agreement Term",_s(term_label)),("Installation",_s(install))]
     for i,(lbl,val) in enumerate(rows):
         p.set_fill_color(248,249,255) if i%2==0 else p.set_fill_color(255,255,255)
-        p.cell(60,6,f"  {lbl}:",fill=True,ln=False)
-        p.cell(0,6,str(val),fill=True,ln=True)
+        p.cell(60,6,_s(f"  {lbl}:"),fill=True,ln=False)
+        p.cell(0,6,_s(str(val)),fill=True,ln=True)
     p.ln(6)
     # Signature
     p.set_font("Helvetica","B",10); p.set_fill_color(245,247,255)
@@ -279,13 +280,13 @@ def _build_receipt_pdf(comp, signer, position, sig_img_bytes, hw, svc, term_labe
             os.unlink(tp); p.ln(24)
         except Exception: p.ln(6)
     p.set_font("Helvetica","",9)
-    p.cell(0,5,f"Signed: {signer}",ln=True)
-    p.cell(0,5,f"Position: {position}",ln=True)
-    p.cell(0,5,f"Date: {date.today().strftime('%d %B %Y')}",ln=True)
+    p.cell(0,5,_s(f"Signed: {signer}"),ln=True)
+    p.cell(0,5,_s(f"Position: {position}"),ln=True)
+    p.cell(0,5,_s(f"Date: {date.today().strftime('%d %B %Y')}"),ln=True)
     p.ln(6)
     p.set_font("Helvetica","I",7); p.set_text_color(130,130,130)
     p.multi_cell(0,4,"By submitting this form, the signatory confirms agreement to the SY Comms "
-                 "proposal and Terms & Conditions available at https://sycomms.co.uk/terms-conditions",align="C")
+                 "proposal and Terms & Conditions: https://sycomms.co.uk/terms-conditions",align="C")
     p.set_text_color(0,0,0)
     return bytes(p.output())
 
