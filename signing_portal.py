@@ -61,10 +61,22 @@ if not gist_id:
 
 @st.cache_data(ttl=300)
 def load_gist(gid):
-    r = requests.get(f"https://api.github.com/gists/{gid}", timeout=10)
+    token = st.secrets.get("GITHUB_TOKEN", "") if hasattr(st, "secrets") else ""
+    hdrs  = {"Authorization": f"token {token}"} if token else {}
+    r = requests.get(f"https://api.github.com/gists/{gid}", headers=hdrs, timeout=10)
     if r.status_code != 200:
         return None
     files = r.json().get("files", {})
+    # Prefer session.json which contains the full deal data
+    for fname in ("session.json", ):
+        if fname in files:
+            raw = files[fname]
+            content_url = raw.get("raw_url", "")
+            if raw.get("truncated") and content_url:
+                r2 = requests.get(content_url, headers=hdrs, timeout=10)
+                return json.loads(r2.text)
+            return json.loads(raw["content"])
+    # Fallback: first JSON file
     for fname, fdata in files.items():
         if fname.endswith(".json"):
             return json.loads(fdata["content"])
@@ -79,14 +91,16 @@ if deal is None:
     st.stop()
 
 # ── Pull key deal values ──────────────────────────────────────────────────────
-comp_name    = deal.get("comp_name", deal.get("q_comp_name", ""))
-contact      = deal.get("contact_name", deal.get("q_contact", ""))
-total_mo     = deal.get("total_mo", 0.0)
-hw_rental    = deal.get("hw_monthly_spread", 0.0)
-svc_total    = deal.get("svc_total_sell", 0.0)
-lease_months = deal.get("lease_term", 84)
-install_type = deal.get("install_type", deal.get("q_install_type", ""))
-address      = deal.get("address", deal.get("q_address", ""))
+comp_name    = deal.get("comp_name", deal.get("customer_name", ""))
+contact      = deal.get("contact_name", deal.get("customer_name", ""))
+total_mo     = float(deal.get("total_mo", 0.0))
+hw_rental    = float(deal.get("hw_monthly_spread", 0.0))
+svc_total    = float(deal.get("svc_total_sell", 0.0))
+lease_months = int(deal.get("lease_term", 84))
+lease_label  = deal.get("lease_label", f"{lease_months} months")
+install_type = deal.get("install_type", "")
+bb_info      = f"{deal.get('bb_provider','')} {deal.get('bb_package','')}".strip()
+address      = deal.get("install_address", "")
 pdf_b64      = deal.get("pdf_b64", "")
 
 st.markdown(f"### Welcome, {contact or comp_name or 'there'} 👋")
@@ -107,12 +121,12 @@ with col2:
     st.markdown(f"""<div class="sy-card">
       <div class="sy-label">Monthly Services</div>
       <div class="sy-value">£{svc_total:.2f}/mo</div>
-      <div style="font-size:0.78rem;color:#aaa">Licences + BB + VAT</div>
+      <div style="font-size:0.78rem;color:#aaa">{bb_info if bb_info else "Licences + BB + VAT"}</div>
     </div>""", unsafe_allow_html=True)
 with col3:
     st.markdown(f"""<div class="sy-card">
       <div class="sy-label">Agreement Term</div>
-      <div class="sy-value">{lease_months} months</div>
+      <div class="sy-value">{lease_label}</div>
       <div style="font-size:0.78rem;color:#aaa">{install_type}</div>
     </div>""", unsafe_allow_html=True)
 
